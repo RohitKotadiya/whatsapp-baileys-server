@@ -1,0 +1,19 @@
+{
+  "name": "baileys-server",
+  "version": "1.0.0",
+  "description": "WhatsApp sender microservice for AFM POS",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.18.2",
+    "pino": "^9.0.0",
+    "qrcode": "^1.5.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
