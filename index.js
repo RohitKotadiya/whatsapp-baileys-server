@@ -7,6 +7,7 @@ const {
 const express = require("express")
 const QRCode = require("qrcode")
 const pino = require("pino")
+const fs = require("fs")
 
 const app = express()
 app.use(express.json())
@@ -19,54 +20,71 @@ if (!API_SECRET) {
   process.exit(1)
 }
 
-let sock = null
-let latestQR = null
-let connectionStatus = "disconnected" // "disconnected" | "connecting" | "qr_pending" | "connected"
-
 const logger = pino({ level: "silent" })
 
-async function connectToWhatsApp() {
-  connectionStatus = "connecting"
-  const { state, saveCreds } = await useMultiFileAuthState("./auth_info")
+// sessions: Map<sessionId, { sock, status, latestQR }>
+const sessions = new Map()
+
+async function connectSession(sessionId) {
+  console.log(`[${sessionId}] Connecting...`)
+
+  const existing = sessions.get(sessionId) || {}
+  const sessionData = { ...existing, status: "connecting", latestQR: null }
+  sessions.set(sessionId, sessionData)
+
+  const { state, saveCreds } = await useMultiFileAuthState(`./auth_info/${sessionId}`)
   const { version } = await fetchLatestBaileysVersion()
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     auth: state,
     logger,
-    printQRInTerminal: true,
+    printQRInTerminal: false,
     browser: ["AFM POS", "Chrome", "1.0.0"],
   })
+  sessionData.sock = sock
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update
 
     if (qr) {
-      latestQR = await QRCode.toDataURL(qr)
-      connectionStatus = "qr_pending"
-      console.log("QR code ready — visit /qr to scan")
+      sessionData.latestQR = await QRCode.toDataURL(qr)
+      sessionData.status = "qr_pending"
+      console.log(`[${sessionId}] QR ready`)
     }
 
     if (connection === "close") {
-      latestQR = null
-      connectionStatus = "disconnected"
+      sessionData.latestQR = null
+      sessionData.status = "disconnected"
       const statusCode = lastDisconnect?.error?.output?.statusCode
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut
-      console.log("Connection closed. Reason:", statusCode, "| Reconnecting:", shouldReconnect)
+      console.log(`[${sessionId}] Disconnected. Code: ${statusCode}. Reconnect: ${shouldReconnect}`)
       if (shouldReconnect) {
-        setTimeout(connectToWhatsApp, 3000)
+        setTimeout(() => connectSession(sessionId), 3000)
       }
     } else if (connection === "open") {
-      latestQR = null
-      connectionStatus = "connected"
-      console.log("WhatsApp connected!")
+      sessionData.latestQR = null
+      sessionData.status = "connected"
+      console.log(`[${sessionId}] Connected!`)
     }
   })
 
   sock.ev.on("creds.update", saveCreds)
 }
 
-// Middleware: API key required
+// On startup, restore all existing sessions from auth_info/
+async function restoreExistingSessions() {
+  const authDir = "./auth_info"
+  if (!fs.existsSync(authDir)) return
+  const entries = fs.readdirSync(authDir)
+  for (const entry of entries) {
+    if (fs.statSync(`${authDir}/${entry}`).isDirectory()) {
+      console.log(`Restoring session: ${entry}`)
+      await connectSession(entry)
+    }
+  }
+}
+
 function requireApiKey(req, res, next) {
   if (req.headers["x-api-key"] !== API_SECRET) {
     return res.status(401).json({ error: "Unauthorized" })
@@ -74,63 +92,105 @@ function requireApiKey(req, res, next) {
   next()
 }
 
-// GET /qr — scan QR code (protected by ?secret=QR_SECRET)
-app.get("/qr", (req, res) => {
+// GET /qr?session=STORE_ID&secret=QR_SECRET
+// Each store scans their own QR here once
+app.get("/qr", async (req, res) => {
   if (QR_SECRET && req.query.secret !== QR_SECRET) {
     return res.status(401).send("Unauthorized")
   }
 
-  if (connectionStatus === "connected") {
-    return res.send("<html><body><h2 style='color:green'>✓ WhatsApp is connected!</h2></body></html>")
+  const sessionId = req.query.session
+  if (!sessionId) {
+    return res.status(400).send(`
+      <html><body style="font-family:sans-serif;padding:20px">
+        <h2>Missing session ID</h2>
+        <p>Usage: <code>/qr?session=YOUR_STORE_ID&secret=QR_SECRET</code></p>
+        <h3>Active sessions:</h3>
+        <ul>${[...sessions.entries()].map(([id, d]) => `<li><strong>${id}</strong>: ${d.status}</li>`).join("") || "<li>None</li>"}</ul>
+      </body></html>
+    `)
   }
 
-  if (!latestQR) {
-    return res.send(`<html><body>
-      <h2>Status: ${connectionStatus}</h2>
-      <p>QR not ready yet. Refresh in a few seconds.</p>
-      <script>setTimeout(() => location.reload(), 3000)</script>
-    </body></html>`)
+  if (!sessions.has(sessionId)) {
+    await connectSession(sessionId)
   }
 
-  res.send(`<html><body style="text-align:center;font-family:sans-serif;padding:20px">
-    <h2>Scan with WhatsApp</h2>
-    <img src="${latestQR}" style="width:300px;height:300px" />
-    <p>Open WhatsApp → Linked Devices → Link a Device</p>
-    <p style="color:#888;font-size:12px">Page auto-refreshes every 5s</p>
-    <script>setTimeout(() => location.reload(), 5000)</script>
-  </body></html>`)
+  const session = sessions.get(sessionId)
+
+  if (session.status === "connected") {
+    return res.send(`
+      <html><body style="text-align:center;font-family:sans-serif;padding:20px">
+        <h2 style="color:green">✓ WhatsApp Connected!</h2>
+        <p>Session: <strong>${sessionId}</strong></p>
+      </body></html>
+    `)
+  }
+
+  if (!session.latestQR) {
+    return res.send(`
+      <html><body style="text-align:center;font-family:sans-serif;padding:20px">
+        <h2>Waiting for QR...</h2>
+        <p>Session: <strong>${sessionId}</strong> — Status: ${session.status}</p>
+        <script>setTimeout(() => location.reload(), 3000)</script>
+      </body></html>
+    `)
+  }
+
+  res.send(`
+    <html><body style="text-align:center;font-family:sans-serif;padding:20px">
+      <h2>Scan with WhatsApp</h2>
+      <p>Session: <strong>${sessionId}</strong></p>
+      <img src="${session.latestQR}" style="width:300px;height:300px" />
+      <p>Open WhatsApp → Linked Devices → Link a Device</p>
+      <p style="color:#888;font-size:12px">Auto-refreshes every 5s</p>
+      <script>setTimeout(() => location.reload(), 5000)</script>
+    </body></html>
+  `)
 })
 
-// GET /status
+// GET /status — all sessions or ?session=STORE_ID
 app.get("/status", requireApiKey, (req, res) => {
-  res.json({ status: connectionStatus })
+  const sessionId = req.query.session
+  if (sessionId) {
+    const session = sessions.get(sessionId)
+    return res.json({ session: sessionId, status: session?.status || "not_found" })
+  }
+  const all = {}
+  sessions.forEach((data, id) => { all[id] = data.status })
+  res.json({ sessions: all })
 })
 
-// POST /send — { to: "9876543210", message: "..." }
+// POST /send — { sessionId, to, message }
 app.post("/send", requireApiKey, async (req, res) => {
-  const { to, message } = req.body
+  const { sessionId, to, message } = req.body
 
-  if (!to || !message) {
-    return res.status(400).json({ error: "to and message are required" })
+  if (!sessionId || !to || !message) {
+    return res.status(400).json({ error: "sessionId, to, and message are required" })
   }
 
-  if (connectionStatus !== "connected") {
-    return res.status(503).json({ error: "WhatsApp not connected", status: connectionStatus })
+  const session = sessions.get(sessionId)
+
+  if (!session || session.status !== "connected") {
+    return res.status(503).json({
+      error: "WhatsApp not connected for this session",
+      status: session?.status || "not_found",
+      hint: `Visit /qr?session=${sessionId} to connect`,
+    })
   }
 
   try {
     const cleanNumber = String(to).replace(/^(\+91|91)/, "").replace(/\s+/g, "")
     const jid = `91${cleanNumber}@s.whatsapp.net`
-    await sock.sendMessage(jid, { text: message })
+    await session.sock.sendMessage(jid, { text: message })
     res.json({ success: true })
   } catch (err) {
-    console.error("Send error:", err.message)
+    console.error(`[${sessionId}] Send error:`, err.message)
     res.status(500).json({ error: err.message })
   }
 })
 
 const PORT = process.env.PORT || 8080
 app.listen(PORT, () => {
-  console.log(`Baileys server running on port ${PORT}`)
-  connectToWhatsApp()
+  console.log(`Baileys multi-session server running on port ${PORT}`)
+  restoreExistingSessions()
 })
