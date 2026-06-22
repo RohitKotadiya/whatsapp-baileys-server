@@ -61,6 +61,14 @@ async function connectSession(sessionId) {
       console.log(`[${sessionId}] Disconnected. Code: ${statusCode}. Reconnect: ${shouldReconnect}`)
       if (shouldReconnect) {
         setTimeout(() => connectSession(sessionId), 3000)
+      } else {
+        // Logged out from phone — delete stale creds so next QR scan starts fresh
+        const authDir = `./auth_info/${sessionId}`
+        if (fs.existsSync(authDir)) {
+          fs.rmSync(authDir, { recursive: true, force: true })
+          console.log(`[${sessionId}] Auth files cleared after logout`)
+        }
+        sessions.delete(sessionId)
       }
     } else if (connection === "open") {
       sessionData.latestQR = null
@@ -111,7 +119,8 @@ app.get("/qr", async (req, res) => {
     `)
   }
 
-  if (!sessions.has(sessionId)) {
+  const existing = sessions.get(sessionId)
+  if (!existing || existing.status === "disconnected") {
     await connectSession(sessionId)
   }
 
